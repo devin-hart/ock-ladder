@@ -98,18 +98,24 @@ function seedFromFile(onEvent) {
 }
 
 function startTail(onEvent) {
-  // Replay existing log once, then follow new lines
   seedFromFile(onEvent);
 
-  const child = spawn('tail', ['-n', '0', '-F', LOG]);
-  const rl = readline.createInterface({ input: child.stdout });
-  rl.on('line', (raw) => dispatch(raw, onEvent));
-  child.on('error', (err) => onEvent({ type: 'error', err }));
-  return () => {
-    try {
-      child.kill();
-    } catch (_) {}
-  };
+  function spawnTail() {
+    const child = spawn('tail', ['-n', '0', '-F', LOG]);
+    const rl = readline.createInterface({ input: child.stdout });
+    rl.on('line', (raw) => dispatch(raw, onEvent));
+    child.on('error', (err) => {
+      onEvent({ type: 'error', err });
+      setTimeout(spawnTail, 1000);
+    });
+    child.on('close', () => {
+      setTimeout(spawnTail, 1000); // auto-restart on exit
+    });
+    return child;
+  }
+
+  let current = spawnTail();
+  return () => { try { current.kill(); } catch {} };
 }
 
 // In-memory state for /api/match

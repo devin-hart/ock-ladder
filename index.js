@@ -16,7 +16,9 @@ const ms = new MatchState();
 // one handler for all parsed log events
 function onEvent(evt) {
   try { ms.onEvent(evt); } catch (e) { console.error('ms.onEvent error:', e); }
-  if (!evt._seed) { // only persist real-time events; seed is warm-up only
+const shouldPersist = (evt.type === 'init') || !evt._seed;
+
+  if (shouldPersist) {
     try { db.onEvent(evt); } catch (e) { console.error('db.onEvent error:', e); }
   }
 }
@@ -24,6 +26,24 @@ function onEvent(evt) {
 // start tailing: this seeds (non-persistent) then follows (persistent)
 startTail(onEvent);
 console.log('tailing log:', LOG);
+
+// Prime DB with a current match if we started mid-map (no InitGame seen)
+(async () => {
+  try {
+    const s = await statusWithTimeout(Q3_HOST, Q3_PORT, 900);
+    const info = s.info || {};
+    const meta = {
+      map: info.mapname || 'unknown',
+      gametype: info.g_gametype || info.gametype || '0',
+      hostname: info.hostname || info.sv_hostname || ''
+    };
+    // send a synthetic init through the normal pipeline (persists to DB)
+    onEvent({ type: 'init', meta });
+    console.log('primed match from UDP:', meta);
+  } catch (e) {
+    console.log('prime skipped:', e.message);
+  }
+})();
 
 // Caching headers (no-store everywhere)
 app.set('etag', false);
@@ -54,21 +74,90 @@ app.get('/api/status', async (_req, res) => {
   }
 });
 
-// Snapshot of current match (from log tailer)
-app.get('/api/match', (_req, res) => {
-  res.json(ms.snapshot());
+// index.js
+const clean = s => (s || '')
+  .replace(/\^[0-9]/g, '')       // strip ^1 color codes
+  .replace(/[^\x20-\x7E]/g, '')  // drop weird bytes
+  .trim();
+
+const BOT_NAMES = new Set([
+  'Wrack','Visor','Gorre','Angel','Mynx','Keel','Orbb','Cadavre','TankJr','Lucy',
+  'Sarge','Grunt','Ranger','Biker','Sorlag','Mr.Gauntlet','Anarki','Bitterman',
+  'Hunter','Major','Uriel','Daemia','Klesk','Stripe', 'Mr.Gauntlet', 'Bones', 'Patriot', 'LakerboT'
+]);
+
+const isBot = (name) => BOT_NAMES.has(clean(name));
+
+const statusWithTimeout = (host, port, ms = 900) =>
+  Promise.race([
+    getStatus(host, port),                            // your UDP status fn
+    new Promise((_, rej) => setTimeout(() => rej(new Error('udp-timeout')), ms)),
+  ]);
+
+app.get('/api/match', async (req, res) => {
+  try {
+    // UDP is the source of truth for who is in the server and their KILLS (score)
+    const s = await statusWithTimeout(Q3_HOST, Q3_PORT, 900);
+    const info = s.info || {};
+    const snap = ms.snapshot();  // used only to add deaths if the same name exists
+
+    // map of live names -> deaths (from snapshot), only if present now
+    const deathsMap = new Map();
+    for (const p of snap.players || []) deathsMap.set(p.name, p.deaths || 0);
+
+    const top5 = (s.players || [])
+      .map(p => {
+        const name = clean(p.name);
+        const kills = Number(p.score) || 0;          // authoritative from UDP
+        const deaths = deathsMap.get(name) || 0;     // best-effort from tail
+        const kd = deaths ? +(kills / deaths).toFixed(2) : kills;
+        return { name, kills, deaths, kd };
+      })
+      .sort((a,b) => b.kills - a.kills)
+      .slice(0, 5);
+
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    return res.json({
+      source: 'udp',
+      current_match: {
+        map: info.mapname || snap.match?.map || 'unknown',
+        gametype: info.g_gametype || snap.match?.gametype || '0',
+        started_at: snap.match?.startedAt || Date.now(),
+        top5
+      }
+    });
+  } catch {
+    // If UDP fails, fall back to tail ONLY (you'll see source:'tail')
+    const snap = ms.snapshot();
+    const top5 = (snap.players || []).slice(0, 5);
+    return res.json({
+      source: 'tail',
+      current_match: {
+        map: snap.match?.map || 'unknown',
+        gametype: snap.match?.gametype || '0',
+        started_at: snap.match?.startedAt || Date.now(),
+        top5
+      }
+    });
+  }
 });
 
+
 // Ladder (persisted across matches; from SQLite)
-app.get('/api/ladder', (_req, res) => {
-  res.json({ players: db.ladder(50) });
+app.get('/api/ladder', (req, res) => {
+  const raw = db.ladder(100);
+  const includeBots = 'includeBots' in req.query;  // e.g. /api/ladder?includeBots=1
+  const players = includeBots ? raw : raw.filter(p => !isBot(p.name));
+  res.json({ players });
 });
 
 // recent matches (DB helper)
-app.get('/api/matches', (req, res) => {
-  const limit = Math.min(+req.query.limit || 10, 50);
-  res.json({ matches: db.recentMatches(limit) });
-});
+// app.get('/api/matches', (req, res) => {
+//   const limit = Math.min(+req.query.limit || 10, 50);
+//   res.json({ matches: db.recentMatches(limit) });
+// });
+
+app.get('/api/matches', (_req, res) => res.json({ matches: [] }));
 
 // Single match detail with per-player scoreboard
 app.get('/api/matches/:id', (req, res) => {
@@ -96,33 +185,64 @@ app.get('/api/players/:name', (req, res) => {
 // One-shot summary for the UI (live + current match + persistent ladder)
 app.get('/api/summary', async (_req, res) => {
   try {
-    // Pull all three in parallel (status can fail harmlessly)
-    const [ladder, snap, status] = await Promise.all([
-      Promise.resolve(db.ladder(5)),
+    const [rawLadder, snap] = await Promise.all([
+      Promise.resolve(db.ladder(100)),   // was db.ladder(5)
       Promise.resolve(ms.snapshot()),
-      getStatus(Q3_HOST, Q3_PORT).catch(() => null),
     ]);
 
-    const current_match = snap.match
-      ? {
-          map: snap.match.map,
-          gametype: snap.match.gametype,
-          started_at: snap.match.startedAt,
-          top5: snap.players.slice(0, 5),
-        }
-      : null;
+    // 2) filter out bots, then take top 5
+    const ladder = rawLadder.filter(p => !isBot(p.name)).slice(0, 25);
 
-    const live = status
-      ? {
-          hostname: status.info.hostname,
-          mapname: status.info.mapname,
-          gametype: status.info.g_gametype || status.info.gametype,
-          player_count: status.players.length,
-          players: status.players.map(p => ({ name: p.name, score: p.score, ping: p.ping })),
-        }
-      : null;
+    let status = null;
+    try { status = await statusWithTimeout(Q3_HOST, Q3_PORT, 900); } catch (_) {}
 
-    res.json({ live, current_match, ladder });
+    let current_match = null;
+    let live = null;
+
+    if (status) {
+      const info = status.info || {};
+      const deathsMap = new Map();
+      for (const p of snap.players || []) deathsMap.set(p.name, p.deaths || 0);
+
+      const top5 = (status.players || [])
+        .map(p => {
+          const name = clean(p.name);
+          const kills = Number(p.score) || 0;         // authoritative from UDP
+          const deaths = deathsMap.get(name) || 0;    // best-effort from tail
+          const kd = deaths ? +(kills / deaths).toFixed(2) : kills;
+          return { name, kills, deaths, kd };
+        })
+        .sort((a,b) => b.kills - a.kills)
+        .slice(0, 5);
+
+      current_match = {
+        map: info.mapname || snap.match?.map || 'unknown',
+        gametype: info.g_gametype || snap.match?.gametype || '0',
+        started_at: snap.match?.startedAt || Date.now(),
+        top5,
+      };
+
+      live = {
+        hostname: info.hostname,
+        mapname: info.mapname,
+        gametype: info.g_gametype || info.gametype,
+        player_count: status.players.length,
+        players: status.players.map(p => ({ name: clean(p.name), score: p.score, ping: p.ping })),
+      };
+    } else if (snap.match) {
+      // UDP failed → fall back to tail only (can be stale, but consistent)
+      current_match = {
+        map: snap.match.map,
+        gametype: snap.match.gametype,
+        started_at: snap.match.startedAt,
+        top5: snap.players.slice(0, 5).map(p => ({
+          name: clean(p.name), kills: p.kills, deaths: p.deaths, kd: p.kd
+        })),
+      };
+    }
+
+    res.set('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.json({ source: status ? 'udp' : 'tail', live, current_match, ladder });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
