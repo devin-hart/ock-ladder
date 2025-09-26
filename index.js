@@ -1,7 +1,8 @@
-// index.js — keep caret-colored names end-to-end; no stripping sent to DB
+// index.js — unified /api/snapshot (alias: /api/summary) + ETag + 1s cache
 
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 const { getStatus } = require('./status');
 const db = require('./db');
 const { startTail } = require('./logtail');
@@ -11,12 +12,20 @@ const Q3_HOST = process.env.Q3_HOST || '127.0.0.1';
 const Q3_PORT = +(process.env.Q3_PORT || 27960);
 
 const app = express();
-app.use(cors()); // enable locally if you want
+app.use(cors()); // allow local dev (Vite/localhost)
 
-/* -------- helpers (ONLY for in-memory math / filters) -------- */
-// We *do not* use this for storage. It's just to key KD stats and filter bots.
+// ---------------- helpers ----------------
 const decolor = (s = '') =>
   s.replace(/\^[0-9]/g, '').replace(/\^x[0-9a-fA-F]{6}/g, '').trim();
+
+const normalizeName = (s = '') => decolor(s).toLowerCase();
+
+const BOT_NAMES = new Set([
+  'wrack','visor','gorre','angel','mynx','keel','orbb','cadavre','tankjr','lucy','sarge','grunt',
+  'ranger','biker','sorlag','mr.gauntlet','anarki','bitterman','hunter','major','uriel','daemia',
+  'klesk','stripe','patriot','lakerbot','bones','slash','argus^f+','xaero','doom','hossman','crash',
+  'phobos','razor'
+]);
 
 class MatchState {
   constructor() { this.reset(); }
@@ -78,41 +87,21 @@ class MatchState {
         return;
     }
   }
-  snapshot() {
-    const players = Object.entries(this.stats)
-      .filter(([name]) => name && name !== '<world>')
-      .map(([name, s]) => ({
-        name,
-        kills: s.kills,
-        deaths: s.deaths,
-        kd: s.deaths ? +(s.kills / s.deaths).toFixed(2) : s.kills,
-      }))
-      .sort((a, b) => b.kills - a.kills);
-    return { match: this.current, players };
-  }
 }
 
 const ms = new MatchState();
 
-/* -------------------- helpers -------------------- */
-const normalizeName = (s = '') => decolor(s).toLowerCase();
-
-const BOT_NAMES = new Set([
-  'wrack','visor','gorre','angel','mynx','keel','orbb','cadavre','tankjr','lucy','sarge','grunt',
-  'ranger','biker','sorlag','mr.gauntlet','anarki','bitterman','hunter','major','uriel','daemia',
-  'klesk','stripe','patriot','lakerbot','bones','slash','argus^f+','xaero','doom','hossman','crash', 'phobos', 'razor'
-]);
-
 const mergeDeaths = (udpPlayers = [], state = ms) => {
   const stats = state?.stats || {};
   return udpPlayers.map((p) => {
-    const clean = decolor(p.name);
+    const colored = p.name || '';           // caret-colored from UDP
+    const clean   = decolor(colored);       // plain for KD merge / keys
     const deathStat = stats[clean];
-    const kills = Number(p.score || 0);
+    const kills  = Number(p.score || 0);
     const deaths = Number(deathStat?.deaths || 0);
     return {
-      // this is just for the "current match" view; DB/ladder still use colored
       name: clean,
+      colored,
       kills,
       deaths,
       kd: deaths ? +(kills / deaths).toFixed(2) : kills
@@ -121,14 +110,11 @@ const mergeDeaths = (udpPlayers = [], state = ms) => {
 };
 
 const statusWithTimeout = async (host = Q3_HOST, port = Q3_PORT, timeoutMs = 1200) => {
-  try {
-    return await getStatus(host, port, timeoutMs);
-  } catch {
-    return null;
-  }
+  try { return await getStatus(host, port, timeoutMs); }
+  catch { return null; }
 };
 
-/* -------------------- log tail → DB sink -------------------- */
+// --------------- log tail → DB ---------------
 const mapType = (t) => {
   const s = String(t || '').toLowerCase();
   if (s === 'init' || s === 'initgame') return 'InitGame';
@@ -141,8 +127,8 @@ const mapType = (t) => {
 const shouldPersist = (evt) => {
   if (!evt) return false;
   const type = mapType(evt.type);
-  if (type === 'Kill' && !evt._seed) return true;              // live kills only
-  if (evt._seed && type !== 'InitGame') return false;          // only seed InitGame
+  if (type === 'Kill' && !evt._seed) return true;       // live kills only
+  if (evt._seed && type !== 'InitGame') return false;   // only seed InitGame
   return true;
 };
 
@@ -150,20 +136,15 @@ const onTailEvent = (evt) => {
   try {
     const norm = evt ? { ...evt, type: mapType(evt.type) } : null;
     ms.onEvent(norm);
-    if (shouldPersist(norm)) {
-      if (norm.type === 'Kill' && !norm._seed) {
-        console.log('PERSIST KILL:', norm.killer?.name, '→', norm.victim?.name);
-      }
-      db.onEvent(norm); // norm carries colored names from logtail
-    }
+    if (shouldPersist(norm)) db.onEvent(norm); // persist colored names
   } catch (e) {
     console.error('onTailEvent error:', e);
   }
 };
 
-startTail(onTailEvent); // logtail already preserves colors. :contentReference[oaicite:1]{index=1}
+startTail(onTailEvent);
 
-/* Prime a match from UDP on boot so frags persist mid-game */
+// Prime a match from UDP on boot so frags persist mid-game
 (async () => {
   try {
     const status = await statusWithTimeout();
@@ -175,119 +156,111 @@ startTail(onTailEvent); // logtail already preserves colors. :contentReference[o
       hostname: info.sv_hostname || info.hostname || '',
       ts: Date.now()
     });
-  } catch {
-    // non-fatal
-  }
+  } catch { /* non-fatal */ }
 })();
 
-/* -------------------- routes -------------------- */
+// --------------- snapshot builder + cache ---------------
+const buildSnapshot = async ({ limit = 25, includeBots = false } = {}) => {
+  const status   = await statusWithTimeout();
+  const info     = status?.info || {};
+  const udpList  = Array.isArray(status?.players) ? status.players : [];
 
-// Health
-app.get('/health', (_req, res) => res.json({ ok: true }));
-
-// UDP raw
-app.get('/api/status', async (_req, res) => {
-  const status = await statusWithTimeout();
-  if (!status) return res.status(504).json({ error: 'udp_timeout' });
-  res.set('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate');
-  res.json(status);
-});
-
-// Current match snapshot (UDP-first with death merge). Keep `top5` to avoid UI break.
-app.get('/api/match', async (_req, res) => {
-  const status = await statusWithTimeout();
-  const info = status?.info || {};
-  const players = Array.isArray(status?.players) ? status.players : [];
-  const merged = mergeDeaths(players, ms).sort((a, b) => b.kills - a.kills);
-  const top5 = merged.slice(0, 5);
-
+  const merged   = mergeDeaths(udpList, ms).sort((a, b) => b.kills - a.kills);
   const current_match = {
     map: info.mapname || 'unknown',
     gametype: info.g_gametype || info.gametype || 'FFA',
     started_at: ms?.current?.startedAt || Date.now(),
-    top5
+    players: merged,
+    top5: merged.slice(0, 5), // back-compat
   };
 
-  res.set('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate');
-  res.json({ source: status ? 'udp' : 'tail', current_match });
-});
+  const ladderRaw = db.ladder(Math.min(Number(limit) || 25, 100));
+  const filtered  = includeBots ? ladderRaw
+    : ladderRaw.filter(r => !BOT_NAMES.has(normalizeName(r.name)));
 
-// Ladder (humans by default; includeBots=1 to show all)
-app.get('/api/ladder', (req, res) => {
-  const includeBots = req.query.includeBots === '1';
-  const limit = Math.min(Number(req.query.limit || 25), 100);
-
-  const rows = db.ladder(limit); // rows already have colored names from DB
-  const filtered = includeBots
-    ? rows
-    : rows.filter(r => !BOT_NAMES.has(normalizeName(r.name)));
-
-  const players = filtered.map(r => {
+  const ladder = filtered.map(r => {
     const kills = Number(r.kills || 0);
     const deaths = Number(r.deaths || 0);
-    return {
-      ...r, // includes: id, name (colored), name_colored (same), kills, deaths
-      kills,
-      deaths,
-      kd: deaths ? +(kills / deaths).toFixed(2) : kills
-    };
+    return { ...r, kills, deaths, kd: deaths ? +(kills / deaths).toFixed(2) : kills };
   });
 
-  res.set('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate');
-  res.json({ players });
-});
+  const live = status ? {
+    hostname: info.sv_hostname || info.hostname || '',
+    mapname:  info.mapname || info.map || 'unknown',
+    player_count: udpList.length
+  } : null;
 
-// Matches placeholder (hidden for now)
-app.get('/api/matches', (_req, res) => res.json({ matches: [] }));
+  return { source: status ? 'udp' : 'tail', live, current_match, ladder };
+};
 
-// Summary: current match + ladder (NO DB "hint" with stripped name anymore)
-app.get('/api/summary', async (req, res) => {
+// 1s per-key hot cache + ETag
+let SNAP_CACHE = { key: '', at: 0, etag: '', json: '' };
+
+const sendJSONWithETag = (req, res, payload) => {
+  const json = typeof payload === 'string' ? payload : JSON.stringify(payload);
+  const etag = 'W/"' + crypto.createHash('sha1').update(json).digest('hex') + '"';
+  res.set('ETag', etag);
+  res.set('Cache-Control', 'no-cache'); // client revalidates with ETag
+  if (req.headers['if-none-match'] === etag) {
+    res.status(304).end();
+  } else {
+    res.type('application/json').send(json);
+  }
+};
+
+// ---------------- routes ----------------
+app.get('/health', (_req, res) => res.json({ ok: true }));
+
+// Canonical: /api/snapshot
+const snapshotHandler = async (req, res) => {
   try {
-    const includeBots = req.query.includeBots === '1';
-
-    // Live status (UDP-first)
-    const status = await statusWithTimeout();
-    const info = status?.info || {};
-    const players = Array.isArray(status?.players) ? status.players : [];
-
-    // Current match snapshot with kd
-    const merged = mergeDeaths(players, ms).sort((a, b) => b.kills - a.kills);
-    const top5 = merged.slice(0, 5);
-
-    const current_match = {
-      map: info.mapname || 'unknown',
-      gametype: info.g_gametype || info.gametype || 'FFA',
-      started_at: ms?.current?.startedAt || Date.now(),
-      top5
-    };
-
-    // Ladder with kd and bot filtering (names already colored from DB)
     const limit = Math.min(Number(req.query.limit || 25), 100);
-    const ladderRaw = db.ladder(limit);
-    const filtered = includeBots
-      ? ladderRaw
-      : ladderRaw.filter(r => !BOT_NAMES.has(normalizeName(r.name)));
+    const includeBots = req.query.includeBots === '1';
+    const key = `${limit}|${includeBots}`;
+    const now = Date.now();
 
-    const ladder = filtered.map(r => {
-      const kills = Number(r.kills || 0);
-      const deaths = Number(r.deaths || 0);
-      return {
-        ...r,
-        kills,
-        deaths,
-        kd: deaths ? +(kills / deaths).toFixed(2) : kills
-      };
-    });
+    if (SNAP_CACHE.json && SNAP_CACHE.key === key && (now - SNAP_CACHE.at) < 1000) {
+      res.set('ETag', SNAP_CACHE.etag);
+      res.set('Cache-Control', 'no-cache');
+      if (req.headers['if-none-match'] === SNAP_CACHE.etag) res.status(304).end();
+      else res.type('application/json').send(SNAP_CACHE.json);
+      return;
+    }
 
-    const live = Boolean(status);
-    res.set('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate');
-    res.json({ source: status ? 'udp' : 'tail', live, current_match, ladder });
+    const snapshot = await buildSnapshot({ limit, includeBots });
+    const json = JSON.stringify(snapshot);
+    const etag = 'W/"' + crypto.createHash('sha1').update(json).digest('hex') + '"';
+    SNAP_CACHE = { key, at: now, etag, json };
+
+    sendJSONWithETag(req, res, json);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+};
+
+app.get('/api/snapshot', snapshotHandler);
+
+// Alias for old clients: /api/summary -> /api/snapshot
+app.get('/api/summary', snapshotHandler);
+
+// Thin views (back-compat) — built from the same snapshot
+app.get('/api/match', async (req, res) => {
+  const s = await buildSnapshot({ limit: 25, includeBots: req.query.includeBots === '1' });
+  res.json({ source: s.source, current_match: s.current_match });
 });
 
-/* -------------------- server -------------------- */
+app.get('/api/ladder', async (req, res) => {
+  const s = await buildSnapshot({
+    limit: Math.min(Number(req.query.limit || 25), 100),
+    includeBots: req.query.includeBots === '1'
+  });
+  res.json({ players: s.ladder });
+});
+
+// Hidden/unused placeholder
+app.get('/api/matches', (_req, res) => res.json({ matches: [] }));
+
+// --------------- server ---------------
 app.listen(PORT, '127.0.0.1', () => {
   console.log(`API on http://127.0.0.1:${PORT} → querying ${Q3_HOST}:${Q3_PORT}`);
 });
