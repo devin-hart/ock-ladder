@@ -1,39 +1,117 @@
-// index.js — ES6/arrow, safer boot, UDP-first, human-readable
+// index.js — keep caret-colored names end-to-end; no stripping sent to DB
+
 const express = require('express');
 const cors = require('cors');
-
 const { getStatus } = require('./status');
 const db = require('./db');
-const { startTail, MatchState } = require('./logtail');
+const { startTail } = require('./logtail');
 
+const PORT    = +(process.env.PORT || 3000);
 const Q3_HOST = process.env.Q3_HOST || '127.0.0.1';
-const Q3_PORT = Number(process.env.Q3_PORT || 27960);
-const PORT    = Number(process.env.PORT || 3000);
+const Q3_PORT = +(process.env.Q3_PORT || 27960);
 
 const app = express();
-app.use(cors());
+app.use(cors()); // enable locally if you want
 
-// In-memory live state for quick snapshots (not persisted)
+/* -------- helpers (ONLY for in-memory math / filters) -------- */
+// We *do not* use this for storage. It's just to key KD stats and filter bots.
+const decolor = (s = '') =>
+  s.replace(/\^[0-9]/g, '').replace(/\^x[0-9a-fA-F]{6}/g, '').trim();
+
+class MatchState {
+  constructor() { this.reset(); }
+  reset() {
+    this.current = null;          // { map, gametype, hostname, startedAt }
+    this.playersById = {};        // id -> { nameColored, nameClean, lastSeen }
+    this.stats = {};              // nameClean -> { kills, deaths }
+    this.id = null;
+    this.name = null;
+  }
+  onEvent(evt) {
+    const t = Date.now();
+    switch (evt?.type) {
+      case 'init':
+      case 'InitGame': {
+        const meta = evt.meta || evt;
+        this.current = {
+          map: meta.map || meta.mapname || 'unknown',
+          gametype: meta.gametype || meta.g_gametype || 'FFA',
+          hostname: meta.hostname || '',
+          startedAt: t,
+        };
+        this.name = this.current.map;
+        this.playersById = {};
+        this.stats = {};
+        return;
+      }
+      case 'shutdown':
+      case 'ShutdownGame':
+        this.reset();
+        return;
+
+      case 'user':
+      case 'ClientUserinfoChanged': {
+        const nameColored = evt.name_colored || evt.nameColored || evt.name || '';
+        const nameClean   = decolor(nameColored);
+        if (!nameClean || nameClean === '<world>') return;
+        const cid = evt.clientId ?? -1;
+        this.playersById[cid] = { nameColored, nameClean, lastSeen: t };
+        if (!this.stats[nameClean]) this.stats[nameClean] = { kills: 0, deaths: 0 };
+        return;
+      }
+
+      case 'kill':
+      case 'Kill': {
+        const k = decolor(evt.killerName || evt.killer?.name || '');
+        const v = decolor(evt.victimName || evt.victim?.name || '');
+        if (k) {
+          if (!this.stats[k]) this.stats[k] = { kills: 0, deaths: 0 };
+          this.stats[k].kills++;
+        }
+        if (v) {
+          if (!this.stats[v]) this.stats[v] = { kills: 0, deaths: 0 };
+          this.stats[v].deaths++;
+        }
+        return;
+      }
+      default:
+        return;
+    }
+  }
+  snapshot() {
+    const players = Object.entries(this.stats)
+      .filter(([name]) => name && name !== '<world>')
+      .map(([name, s]) => ({
+        name,
+        kills: s.kills,
+        deaths: s.deaths,
+        kd: s.deaths ? +(s.kills / s.deaths).toFixed(2) : s.kills,
+      }))
+      .sort((a, b) => b.kills - a.kills);
+    return { match: this.current, players };
+  }
+}
+
 const ms = new MatchState();
 
 /* -------------------- helpers -------------------- */
-const stripColors = (s = '') => s.replace(/\^[0-9]/g, '').trim();
-const normalizeName = (s = '') => stripColors(s).toLowerCase();
+const normalizeName = (s = '') => decolor(s).toLowerCase();
 
 const BOT_NAMES = new Set([
   'wrack','visor','gorre','angel','mynx','keel','orbb','cadavre','tankjr','lucy','sarge','grunt',
   'ranger','biker','sorlag','mr.gauntlet','anarki','bitterman','hunter','major','uriel','daemia',
-  'klesk','stripe','patriot','lakerbot','bones'
+  'klesk','stripe','patriot','lakerbot','bones','slash','argus^f+','xaero','doom','hossman','crash', 'phobos', 'razor'
 ]);
 
 const mergeDeaths = (udpPlayers = [], state = ms) => {
   const stats = state?.stats || {};
   return udpPlayers.map((p) => {
-    const clean = stripColors(p.name);
+    const clean = decolor(p.name);
     const deathStat = stats[clean];
     const kills = Number(p.score || 0);
     const deaths = Number(deathStat?.deaths || 0);
     return {
+      // this is just for the "current match" view; DB/ladder still use colored
       name: clean,
       kills,
       deaths,
@@ -63,7 +141,7 @@ const mapType = (t) => {
 const shouldPersist = (evt) => {
   if (!evt) return false;
   const type = mapType(evt.type);
-  if (type === 'Kill' && !evt._seed) return true;              // live kills
+  if (type === 'Kill' && !evt._seed) return true;              // live kills only
   if (evt._seed && type !== 'InitGame') return false;          // only seed InitGame
   return true;
 };
@@ -76,14 +154,14 @@ const onTailEvent = (evt) => {
       if (norm.type === 'Kill' && !norm._seed) {
         console.log('PERSIST KILL:', norm.killer?.name, '→', norm.victim?.name);
       }
-      db.onEvent(norm);
+      db.onEvent(norm); // norm carries colored names from logtail
     }
   } catch (e) {
     console.error('onTailEvent error:', e);
   }
 };
 
-startTail(onTailEvent);
+startTail(onTailEvent); // logtail already preserves colors. :contentReference[oaicite:1]{index=1}
 
 /* Prime a match from UDP on boot so frags persist mid-game */
 (async () => {
@@ -139,7 +217,7 @@ app.get('/api/ladder', (req, res) => {
   const includeBots = req.query.includeBots === '1';
   const limit = Math.min(Number(req.query.limit || 25), 100);
 
-  const rows = db.ladder(limit);
+  const rows = db.ladder(limit); // rows already have colored names from DB
   const filtered = includeBots
     ? rows
     : rows.filter(r => !BOT_NAMES.has(normalizeName(r.name)));
@@ -148,7 +226,7 @@ app.get('/api/ladder', (req, res) => {
     const kills = Number(r.kills || 0);
     const deaths = Number(r.deaths || 0);
     return {
-      ...r,
+      ...r, // includes: id, name (colored), name_colored (same), kills, deaths
       kills,
       deaths,
       kd: deaths ? +(kills / deaths).toFixed(2) : kills
@@ -162,7 +240,7 @@ app.get('/api/ladder', (req, res) => {
 // Matches placeholder (hidden for now)
 app.get('/api/matches', (_req, res) => res.json({ matches: [] }));
 
-// Summary: current match + ladder
+// Summary: current match + ladder (NO DB "hint" with stripped name anymore)
 app.get('/api/summary', async (req, res) => {
   try {
     const includeBots = req.query.includeBots === '1';
@@ -183,7 +261,7 @@ app.get('/api/summary', async (req, res) => {
       top5
     };
 
-    // Ladder with kd and bot filtering
+    // Ladder with kd and bot filtering (names already colored from DB)
     const limit = Math.min(Number(req.query.limit || 25), 100);
     const ladderRaw = db.ladder(limit);
     const filtered = includeBots

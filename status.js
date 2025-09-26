@@ -78,3 +78,49 @@ const getStatus = (host = '127.0.0.1', port = 27960, timeoutMs = 1200) =>
 module.exports = {
     getStatus
 };
+
+// --- Optional: RCON "status" (gets ip:port per player) ---
+const rconStatus = ({ host = '127.0.0.1', port = 27960, password, timeoutMs = 600 }) =>
+  new Promise((resolve) => {
+    if (!password) return resolve([]);           // no password => no-op
+    const sock = dgram.createSocket('udp4');     // dgram already required above
+    let buf = Buffer.alloc(0);
+    const msg = Buffer.from('\xff\xff\xff\xff' + 'rcon ' + password + ' status');
+
+    const close = () => { try { sock.close(); } catch {} };
+    sock.on('message', m => { buf = Buffer.concat([buf, m]); });
+    sock.on('error', () => { close(); resolve([]); });
+
+    sock.send(msg, port, host, () => {
+      setTimeout(() => {                           // small window to collect the reply
+        close();
+        resolve(parseRconStatus(buf.toString('latin1')));
+      }, timeoutMs);
+    });
+  });
+
+const parseRconStatus = (text = '') => {
+  const lines = text.split('\n').map(s => s.trim()).filter(Boolean);
+  const hdr = lines.findIndex(l => /^num\s+score\s+ping\s+name/i.test(l));
+  if (hdr === -1) return [];
+  const out = [];
+  for (let i = hdr + 1; i < lines.length; i++) {
+    const L = lines[i];
+    // Typical row: "0  20  50  d2           40  1.2.3.4:27960  12345  25000"
+    const parts = L.split(/\s+/);
+    if (parts.length < 8) continue;
+    const num   = +parts[0];
+    const score = +parts[1];
+    const ping  = +parts[2];
+    // name may contain spaces; walk until we hit ip:port
+    let j = 3, nameParts = [];
+    while (j < parts.length && !/^\d+\.\d+\.\d+\.\d+:\d+$/.test(parts[j])) { nameParts.push(parts[j]); j++; }
+    const name = nameParts.join(' ').trim();
+    const [ip, portStr] = (parts[j] || '').split(':');
+    out.push({ num, score, ping, name, ip: ip || null, port: +(portStr || 0) || null });
+  }
+  return out;
+};
+
+// extend exports without touching existing ones
+module.exports.rconStatus = rconStatus;
